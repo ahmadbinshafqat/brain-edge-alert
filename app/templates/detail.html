@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<p><a href="/">← Back</a></p>
+<section class="card">
+  <h2>{{ doc.filename }}</h2>
+  <p><span class="badge {{ doc.verdict }}">{{ doc.verdict }}</span> <strong>score {{ '%.2f'|format(doc.anomaly_score) }}</strong></p>
+  <p>{{ doc.explanation }}</p>
+  <table>
+    <tr><th>Vendor</th><td>{{ doc.vendor or 'Unknown' }}</td></tr>
+    <tr><th>Total</th><td>{% if doc.total is not none %}${{ '%.2f'|format(doc.total) }}{% else %}—{% endif %}</td></tr>
+    <tr><th>Date</th><td>{{ doc.date or '—' }}</td></tr>
+    <tr><th>Created</th><td>{{ doc.created_at }}</td></tr>
+  </table>
+</section>
+
+<section class="card">
+  <h2>Similar past documents</h2>
+  {% if matches %}
+  <table>
+    <thead><tr><th>Document</th><th>Similarity</th><th>Reason</th></tr></thead>
+    <tbody>
+    {% for match in matches %}
+      <tr>
+        <td><a href="/documents/{{ match.related_document.id }}">#{{ match.related_document.id }} {{ match.related_document.vendor }}</a><br><span class="muted">{{ match.related_document.filename }}</span></td>
+        <td>{{ '%.2f'|format(match.similarity) }}</td>
+        <td>{{ match.reason }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p>No related documents met the similarity threshold.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Extracted text</h2>
+  <pre>{{ doc.text }}</pre>
+</section>
+{% endblock %}

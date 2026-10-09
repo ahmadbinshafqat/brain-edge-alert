@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card upload">
+  <h2>Upload a receipt, invoice, or bill</h2>
+  <p class="muted">PDFs with selectable text, images with Tesseract OCR, and TXT files are supported.</p>
+  <form action="/upload" method="post" enctype="multipart/form-data">
+    <input type="file" name="file" required accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,.txt,.csv,.md">
+    <br>
+    <button type="submit">Analyze document</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Documents</h2>
+  {% if documents %}
+  <table>
+    <thead><tr><th>Verdict</th><th>Vendor</th><th>Total</th><th>Date</th><th>Explanation</th><th></th></tr></thead>
+    <tbody>
+    {% for doc in documents %}
+      <tr>
+        <td><span class="badge {{ doc.verdict }}">{{ doc.verdict }}</span><br><span class="muted">score {{ '%.2f'|format(doc.anomaly_score) }}</span></td>
+        <td>{{ doc.vendor or 'Unknown' }}<br><span class="muted">{{ doc.filename }}</span></td>
+        <td>{% if doc.total is not none %}${{ '%.2f'|format(doc.total) }}{% else %}—{% endif %}</td>
+        <td>{{ doc.date or '—' }}</td>
+        <td>{{ doc.explanation }}</td>
+        <td><a class="button" href="/documents/{{ doc.id }}">Open</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p>No documents yet. Run <code>python seed.py</code> or upload your first file.</p>
+  {% endif %}
+</section>
+{% endblock %}
