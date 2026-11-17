@@ -1,59 +1,124 @@
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import date, datetime
+from typing import Optional
 
 
 @dataclass
-class ParsedFields:
-    vendor: str
-    total: float | None
-    date: str | None
+class ParsedDocument:
+    vendor: Optional[str]
+    document_date: Optional[date]
+    total_amount: Optional[float]
 
 
-def parse_document_fields(text: str, filename: str) -> ParsedFields:
+_VENDOR_LABEL_RE = re.compile(
+    r"(?:vendor|merchant|company|supplier|billed\s+by|from)\s*[:#-]\s*(?P<vendor>[^\n\r]+)",
+    re.IGNORECASE,
+)
+_DATE_RE = re.compile(
+    r"(?P<date>\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})\b)",
+    re.IGNORECASE,
+)
+_TOTAL_RE = re.compile(
+    r"(?:total|amount\s+due|balance\s+due|grand\s+total|paid)\s*[:#-]?\s*\$?\s*(?P<amount>\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)",
+    re.IGNORECASE,
+)
+_MONEY_RE = re.compile(r"\$\s*(?P<amount>\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{2})?)")
+
+
+def normalize_vendor_name(value: Optional[str]) -> Optional[str]:
+    """Return a clean display/search value for a vendor name.
+
+    The parser sees messy OCR/text snippets. Keeping vendor names consistently
+    stripped of labels, punctuation, and excess whitespace makes historical
+    search and vendor-based anomaly comparison more reliable.
+    """
+    if not value:
+        return None
+
+    cleaned = value.strip()
+    cleaned = re.sub(r"^(vendor|merchant|company|supplier|from|billed\s+by)\s*[:#-]\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = cleaned.strip(" \t\r\n-–—:;,.#")
+
+    if not cleaned:
+        return None
+
+    # Avoid returning an entire OCR line that also contains obvious fields.
+    cleaned = re.split(r"\s{2,}|\t|\b(?:date|invoice|receipt|total|amount)\b\s*[:#-]", cleaned, maxsplit=1, flags=re.IGNORECASE)[0]
+    cleaned = cleaned.strip(" \t\r\n-–—:;,.#")
+    return cleaned or None
+
+
+def parse_document(text: str) -> ParsedDocument:
+    text = text or ""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    vendor = _parse_vendor(lines, filename)
-    total = _parse_total(text)
-    date = _parse_date(text)
-    return ParsedFields(vendor=vendor, total=total, date=date)
+
+    vendor = _parse_vendor(text, lines)
+    document_date = _parse_date(text)
+    total_amount = _parse_total(text)
+
+    return ParsedDocument(vendor=vendor, document_date=document_date, total_amount=total_amount)
 
 
-def _parse_vendor(lines: list[str], filename: str) -> str:
-    ignored = ("invoice", "receipt", "bill", "date", "total", "amount")
-    for line in lines[:8]:
-        cleaned = re.sub(r"[^A-Za-z0-9 &'.-]", "", line).strip()
-        if len(cleaned) >= 3 and not cleaned.lower().startswith(ignored):
-            return cleaned[:255]
-    return Path(filename).stem.replace("_", " ").title()[:255]
+def _parse_vendor(text: str, lines: list[str]) -> Optional[str]:
+    labeled = _VENDOR_LABEL_RE.search(text)
+    if labeled:
+        return normalize_vendor_name(labeled.group("vendor"))
 
-
-def _parse_total(text: str) -> float | None:
-    patterns = [
-        r"(?:total due|amount due|grand total|balance due|total|amount)\s*[:\-]?\s*(?:USD|US\$|\$)?\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{2})?)",
-        r"(?:USD|US\$|\$)\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{2})?)",
-    ]
-    candidates: list[float] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            try:
-                candidates.append(float(match.group(1).replace(",", "")))
-            except ValueError:
-                pass
-        if candidates:
-            return candidates[-1]
-    nums = re.findall(r"\b[0-9]+\.[0-9]{2}\b", text)
-    if nums:
-        return max(float(n) for n in nums)
+    # In many receipts/invoices the first meaningful line is the merchant.
+    for line in lines[:6]:
+        candidate = normalize_vendor_name(line)
+        if not candidate:
+            continue
+        if _TOTAL_RE.search(candidate) or _DATE_RE.search(candidate) or _MONEY_RE.search(candidate):
+            continue
+        if len(candidate) > 80:
+            continue
+        return candidate
     return None
 
 
-def _parse_date(text: str) -> str | None:
-    patterns = [
-        r"\b(20[0-9]{2}[-/][01]?[0-9][-/][0-3]?[0-9])\b",
-        r"\b([01]?[0-9][-/][0-3]?[0-9][-/]20[0-9]{2})\b",
+def _parse_date(text: str) -> Optional[date]:
+    match = _DATE_RE.search(text)
+    if not match:
+        return None
+
+    raw = match.group("date").replace("/", "-").replace(",", "")
+    formats = [
+        "%Y-%m-%d",
+        "%m-%d-%Y",
+        "%d-%m-%Y",
+        "%m-%d-%y",
+        "%d-%m-%y",
+        "%b %d %Y",
+        "%B %d %Y",
     ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1).replace("/", "-")
+    for fmt in formats:
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
     return None
+
+
+def _parse_total(text: str) -> Optional[float]:
+    totals = [_amount_to_float(match.group("amount")) for match in _TOTAL_RE.finditer(text)]
+    totals = [amount for amount in totals if amount is not None]
+    if totals:
+        # The last explicit total is usually the final amount due.
+        return totals[-1]
+
+    amounts = [_amount_to_float(match.group("amount")) for match in _MONEY_RE.finditer(text)]
+    amounts = [amount for amount in amounts if amount is not None]
+    if amounts:
+        # Fallback for simple receipts without labels.
+        return max(amounts)
+    return None
+
+
+def _amount_to_float(value: str) -> Optional[float]:
+    try:
+        return float(value.replace(",", ""))
+    except (TypeError, ValueError):
+        return None

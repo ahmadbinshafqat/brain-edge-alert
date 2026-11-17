@@ -1,94 +1,153 @@
-import os
 import shutil
 from pathlib import Path
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from typing import Optional
+from uuid import uuid4
+
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
 from app.database import Base, engine, get_db
-from app.models import Document, Match
+from app.models import Document, DocumentMatch
 from app.services.analyzer import analyze_document
-from app.services.embedding import text_embedding_json
+from app.services.embedding import dumps_embedding, loads_embedding
 from app.services.extractor import extract_text
-from app.services.parser import parse_document_fields
+from app.services.parser import parse_document
 
 Base.metadata.create_all(bind=engine)
 Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
 
-templates = Jinja2Templates(directory="app/templates")
 app = FastAPI(title="Edge Alert")
+templates = Jinja2Templates(directory="app/templates")
+
+ALLOWED_VERDICTS = {"normal", "review", "unusual"}
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request, db: Session = Depends(get_db)):
-    documents = db.query(Document).order_by(Document.created_at.desc()).all()
-    return templates.TemplateResponse("index.html", {"request": request, "documents": documents})
+def index(
+    request: Request,
+    db: Session = Depends(get_db),
+    vendor: str = Query("", description="Search vendor names"),
+    verdict: str = Query("", description="Filter by verdict"),
+    min_amount: Optional[float] = Query(None, ge=0, description="Minimum document total"),
+    max_amount: Optional[float] = Query(None, ge=0, description="Maximum document total"),
+):
+    vendor = vendor.strip()
+    verdict = verdict.strip().lower()
+
+    if verdict and verdict not in ALLOWED_VERDICTS:
+        verdict = ""
+
+    amount_error = None
+    if min_amount is not None and max_amount is not None and min_amount > max_amount:
+        amount_error = "Minimum amount cannot be greater than maximum amount. Showing unbounded amount results."
+        min_amount = None
+        max_amount = None
+
+    query = db.query(Document)
+
+    if vendor:
+        query = query.filter(Document.vendor.ilike(f"%{vendor}%"))
+    if verdict:
+        query = query.filter(Document.verdict == verdict)
+    if min_amount is not None:
+        query = query.filter(Document.total_amount.isnot(None), Document.total_amount >= min_amount)
+    if max_amount is not None:
+        query = query.filter(Document.total_amount.isnot(None), Document.total_amount <= max_amount)
+
+    documents = query.order_by(Document.created_at.desc()).limit(100).all()
+    total_count = db.query(func.count(Document.id)).scalar() or 0
+    filtered_count = len(documents)
+    filters_active = bool(vendor or verdict or min_amount is not None or max_amount is not None)
+
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "documents": documents,
+            "total_count": total_count,
+            "filtered_count": filtered_count,
+            "filters_active": filters_active,
+            "filters": {
+                "vendor": vendor,
+                "verdict": verdict,
+                "min_amount": "" if min_amount is None else min_amount,
+                "max_amount": "" if max_amount is None else max_amount,
+            },
+            "amount_error": amount_error,
+            "allowed_verdicts": ["normal", "review", "unusual"],
+        },
+    )
 
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided")
+async def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    original_name = Path(file.filename or "upload").name
+    stored_name = f"{uuid4().hex}_{original_name}"
+    stored_path = Path(settings.upload_dir) / stored_name
 
-    safe_name = os.path.basename(file.filename).replace(" ", "_")
-    stored_path = Path(settings.upload_dir) / safe_name
-    counter = 1
-    while stored_path.exists():
-        stored_path = Path(settings.upload_dir) / f"{stored_path.stem}_{counter}{stored_path.suffix}"
-        counter += 1
+    with stored_path.open("wb") as output:
+        shutil.copyfileobj(file.file, output)
 
-    with stored_path.open("wb") as out:
-        shutil.copyfileobj(file.file, out)
+    extracted_text = extract_text(stored_path, file.content_type or "")
+    parsed = parse_document(extracted_text)
 
-    text = extract_text(str(stored_path), file.content_type or "")
-    fields = parse_document_fields(text, safe_name)
+    past_documents = db.query(Document).order_by(Document.created_at.desc()).all()
+    analysis = analyze_document(parsed, extracted_text, past_documents)
 
-    doc = Document(
-        filename=stored_path.name,
-        vendor=fields.vendor,
-        total=fields.total,
-        date=fields.date,
-        text=text,
-        embedding=text_embedding_json(text),
-        verdict="review",
-        anomaly_score=0.0,
-        explanation="Pending analysis.",
+    document = Document(
+        filename=original_name,
+        stored_path=str(stored_path),
+        content_type=file.content_type,
+        extracted_text=extracted_text,
+        vendor=parsed.vendor,
+        document_date=parsed.document_date,
+        total_amount=parsed.total_amount,
+        verdict=analysis.verdict,
+        explanation=analysis.explanation,
+        embedding=dumps_embedding(analysis.embedding),
     )
-    db.add(doc)
+    db.add(document)
     db.flush()
 
-    result = analyze_document(db, doc)
-    doc.verdict = result.verdict
-    doc.anomaly_score = result.score
-    doc.explanation = result.explanation
-    db.commit()
+    for match in analysis.matches:
+        db.add(
+            DocumentMatch(
+                document_id=document.id,
+                matched_document_id=match.document_id,
+                similarity=match.similarity,
+                reason=match.reason,
+            )
+        )
 
-    return RedirectResponse(url=f"/documents/{doc.id}", status_code=303)
+    db.commit()
+    return RedirectResponse(url=f"/documents/{document.id}", status_code=303)
 
 
 @app.get("/documents/{document_id}", response_class=HTMLResponse)
 def document_detail(document_id: int, request: Request, db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
+    document = (
+        db.query(Document)
+        .options(joinedload(Document.matches).joinedload(DocumentMatch.matched_document))
+        .filter(Document.id == document_id)
+        .first()
+    )
+    if not document:
         raise HTTPException(status_code=404, detail="Document not found")
-    matches = db.query(Match).filter(Match.document_id == document_id).order_by(Match.similarity.desc()).all()
-    return templates.TemplateResponse("detail.html", {"request": request, "doc": doc, "matches": matches})
+
+    return templates.TemplateResponse(
+        "detail.html",
+        {
+            "request": request,
+            "document": document,
+            "embedding_dimensions": len(loads_embedding(document.embedding)),
+        },
+    )
 
 
-@app.get("/api/documents/{document_id}")
-def document_json(document_id: int, db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    return {
-        "id": doc.id,
-        "filename": doc.filename,
-        "vendor": doc.vendor,
-        "total": doc.total,
-        "date": doc.date,
-        "verdict": doc.verdict,
-        "anomaly_score": doc.anomaly_score,
-        "explanation": doc.explanation,
-    }
+@app.get("/health")
+def health():
+    return {"status": "ok"}
